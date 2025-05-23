@@ -4,12 +4,29 @@ import logging
 import logging.config
 import yaml
 import argparse
+from aiohttp import web
 
 from event_loop import EventLoop
 
 """Driver module"""
 
 logger = logging.getLogger(__name__)
+health_runner = None
+
+async def health_check_handler(request):
+    return web.json_response({"status": "healthy"}, status=200)
+
+async def start_health_check_server(port=5000): # Port 5000 as in docker-compose
+    app = web.Application()
+    app.router.add_get("/health", health_check_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    logger.info(f"Health check server started on port {port}")
+    # Keep it running in the background.
+    # For graceful shutdown, this runner would need to be cleaned up in the shutdown function.
+    return runner # Return runner to manage its lifecycle
 
 def init_argparse() -> None:
     """Fetch the command line arguments and operate on them"""
@@ -29,10 +46,15 @@ def init_argparse() -> None:
 
 async def shutdown(signal=None):
     """Shutdown function to gracefully stop asyncio tasks and the event loop."""
+    global health_runner
     if signal:
         logger.info(f"Received exit signal {signal.name}...")
     else:
         logger.info("Shutdown initiated...")
+
+    if health_runner:
+        logger.info("Stopping health check server...")
+        await health_runner.cleanup()
 
     logger.info('Cancelling outstanding asyncio tasks...')
     tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
@@ -57,11 +79,15 @@ def main():
     logger.debug('Initializing the event loop')
     event_loop = EventLoop()
     loop = asyncio.get_event_loop()
+    global health_runner
 
     # Register signal handlers for safe shutdown
     register_signals(loop)
 
     try:
+        # Start the health check server
+        health_runner = loop.run_until_complete(start_health_check_server())
+
         # Schedule the coroutines to run
         asyncio.ensure_future(event_loop.data_provider_loop())
         asyncio.ensure_future(event_loop.plugins_runner_loop())
