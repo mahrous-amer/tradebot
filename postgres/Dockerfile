@@ -10,10 +10,8 @@ RUN apt-get update && apt-get install -y timescaledb-2-postgresql-16 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-RUN echo "shared_preload_libraries = 'timescaledb'" >> /var/lib/postgresql/data/postgresql.conf
-
 COPY load-extensions.sh /docker-entrypoint-initdb.d/
 
 COPY ./*.sql /docker-entrypoint-initdb.d/
 
-# RUN timescaledb-tune
+RUN timescaledb-tune --quiet --yes

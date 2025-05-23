@@ -1,0 +1,11 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+  # Add other services to scrape here if needed, e.g., the bot or api if they expose metrics.
+  # - job_name: 'bot'
+  #   static_configs:
+  #     - targets: ['bot:YOUR_METRICS_PORT'] # Assuming bot service name and a metrics port
