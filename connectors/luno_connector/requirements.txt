@@ -1,0 +1,7 @@
+fastapi>=0.100.0
+uvicorn[standard]>=0.20.0
+ccxt>=4.0.0 # Using ccxt for Luno
+redis>=5.0.0
+prometheus-client>=0.20.0
+pydantic>=2.0.0
+# python-dotenv is not strictly needed if all config is via env vars passed by Docker Compose

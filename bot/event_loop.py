@@ -35,14 +35,18 @@ class EventLoop:
 
         Sets up the data providers, plugin handler, and decision maker.
         """
-        # Initialize data providers for Luno, Kraken, and Binance
+        # The main DataProvider now consumes from Redis Streams for Binance and Luno
+        self.data_provider = DataProvider() # This is the generic, Redis-consuming DataProvider
+        
+        # data_providers list is for providers that have their own `tick` method for polling.
+        # Luno() and Binance() direct polling classes are deprecated/disabled.
+        # Kraken() remains as an example of an old-style direct polling provider.
         self.data_providers = [
-            Luno(),
-            Kraken(),
-            Binance()
+            Kraken() 
+            # Luno() and Binance() removed as their data is sourced via Redis by the main self.data_provider
         ]
-        # Use the first provider (Luno) for plugins to match original behavior
-        self.data_provider = self.data_providers[0]
+        
+        # Ensure PluginHandler uses the main DataProvider instance that consumes from Redis
         self.plugin_handler = PluginHandler('plugins', self.data_provider)
         self.decision_maker = DecisionMaker()
 

@@ -1,0 +1,7 @@
+fastapi>=0.100.0
+uvicorn[standard]>=0.20.0
+python-binance>=1.0.19
+redis>=5.0.1
+prometheus-client>=0.20.0
+pydantic>=2.0.0
+python-dotenv>=0.20.0

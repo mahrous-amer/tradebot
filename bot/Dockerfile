@@ -12,6 +12,13 @@ RUN useradd --create-home appuser
 
 WORKDIR /src
 
+# Set PYTHONPATH to include /src so common_models can be found
+ENV PYTHONPATH="/src:${PYTHONPATH}"
+
+# Copy common_models package first, relative to the Dockerfile's context (bot/)
+COPY ../common_models /src/common_models
+
+# Copy the bot's own application code
 COPY ./ /src
 
 RUN mkdir -p /src/logs

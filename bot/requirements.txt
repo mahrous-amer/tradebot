@@ -36,3 +36,4 @@ ccxt==4.4.4
 aiofiles
 tenacity
 asyncpg
+prometheus-client>=0.20.0

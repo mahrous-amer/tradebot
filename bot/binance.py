@@ -97,30 +97,33 @@ class Binance(DataProvider):
 
     async def collect(self):
         """Collect data (balance, ticker, order book, trades) for Binance trading pairs."""
-        pairs = ['BTC/USDT', 'ETH/USDT', 'XRP/USDT']  # Binance-specific pairs
-        data = {}
-        for pair in pairs:
-            try:
-                balance = await self.fetch_balance()
-                tick = await self.fetch_tick(pair)
-                orderbook = await self.fetch_order_book(pair)
-                trades = await self.fetch_trades(pair)
-                data.update({pair: {'tick': tick, 'order_book': orderbook, 'trades': trades, 'balance': balance}})
-            except Exception as e:
-                logger.error(f'Exception from CCXT.BINANCE for pair {pair}: {e}')
-        return data
+        # pairs = ['BTC/USDT', 'ETH/USDT', 'XRP/USDT']  # Binance-specific pairs
+        # data = {}
+        # for pair in pairs:
+        #     try:
+        #         balance = await self.fetch_balance()
+        #         tick = await self.fetch_tick(pair)
+        #         orderbook = await self.fetch_order_book(pair)
+        #         trades = await self.fetch_trades(pair)
+        #         data.update({pair: {'tick': tick, 'order_book': orderbook, 'trades': trades, 'balance': balance}})
+        #     except Exception as e:
+        #         logger.error(f'Exception from CCXT.BINANCE for pair {pair}: {e}')
+        logger.info("Binance.collect() is now disabled. Data is provided by binance-connector service.")
+        return {}
 
     async def tick(self):
         """Main method to collect and broadcast data from Binance."""
-        data = None
-        self.connect()
-        try:
-            data = await self.collect()
-            if data:
-                await super().broadcast(data)
-            else:
-                logger.info('No data provided from Binance')
-        except Exception as e:
-            logger.error(f'Exception from Binance Provider: {e}')
-        finally:
-            await self.disconnect()
+        # data = None
+        # self.connect()
+        # try:
+        #     data = await self.collect()
+        #     if data:
+        #         await super().broadcast(data)
+        #     else:
+        #         logger.info('No data provided from Binance')
+        # except Exception as e:
+        #     logger.error(f'Exception from Binance Provider: {e}')
+        # finally:
+        #     await self.disconnect()
+        logger.info("Binance.tick() is now disabled. Data is provided by binance-connector service.")
+        pass

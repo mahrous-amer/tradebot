@@ -3,40 +3,102 @@ import logging
 import json
 import ast
 import configparser
-import ccxt.async_support as ccxt
+import os
+import uuid 
+import time # Added for timing E2E latency
+# Removed: import aiohttp 
+import ccxt.async_support as ccxt # Keep for Luno
 from storage import Storage
+from common_models.commands_events_models import ( 
+    PlaceOrderCommand, 
+    OrderResponseEvent, 
+    OrderStatusUpdateEvent
+)
+from prometheus_client import Counter, Gauge, Histogram, exponential_buckets # Added
 
 logger = logging.getLogger(__name__)
 
-CHECK_TIMEOUT = 15  # Timeout in seconds for checking order status
+CHECK_TIMEOUT = 15  # Timeout for Luno order status (if used)
 SLEEP_DURATION = 60  # Duration to sleep in the main method
 
+# --- Prometheus Metrics Definitions for DecisionMaker ---
+DM_ORDER_COMMANDS_SENT_TOTAL = Counter(
+    'dm_order_commands_sent_total', 
+    'Total order commands sent by DecisionMaker', 
+    ['exchange', 'pair']
+)
+DM_ORDER_EVENTS_RECEIVED_TOTAL = Counter(
+    'dm_order_events_received_total', 
+    'Total order events received by DecisionMaker', 
+    ['exchange', 'event_type', 'pair']
+)
+DM_ORDER_E2E_DURATION_SECONDS = Histogram(
+    'dm_order_e2e_duration_seconds', 
+    'End-to-end time from sending PlaceOrderCommand to receiving terminal order status', 
+    ['exchange', 'pair'],
+    buckets=exponential_buckets(0.5, 2, 12) # 0.5s to ~1024s (adjust as needed)
+)
+DM_PENDING_ORDERS_GAUGE = Gauge(
+    'dm_pending_orders', 
+    'Number of currently pending orders being tracked by DecisionMaker', 
+    ['exchange']
+)
+# --- End Prometheus Metrics Definitions ---
+
+# Redis Stream Names for Connector interaction
+BINANCE_CONNECTOR_NAME = "binance_connector"
+LUNO_CONNECTOR_NAME = "luno_connector"
+
+BINANCE_PLACE_ORDER_COMMAND_STREAM = f"{BINANCE_CONNECTOR_NAME}:commands:place_order"
+BINANCE_ORDER_RESPONSE_EVENT_STREAM = f"{BINANCE_CONNECTOR_NAME}:events:order_response"
+BINANCE_ORDER_STATUS_UPDATE_EVENT_STREAM = f"{BINANCE_CONNECTOR_NAME}:events:order_status"
+
+LUNO_PLACE_ORDER_COMMAND_STREAM = f"{LUNO_CONNECTOR_NAME}:commands:place_order"
+LUNO_ORDER_RESPONSE_EVENT_STREAM = f"{LUNO_CONNECTOR_NAME}:events:order_response"
+LUNO_ORDER_STATUS_UPDATE_EVENT_STREAM = f"{LUNO_CONNECTOR_NAME}:events:order_status"
+
+
 class DecisionMaker:
-    """Handles trading decisions and order placements based on input data."""
+    """Handles trading decisions and order placements based on input data from multiple exchanges via Redis."""
 
-    def __init__(self, check_timeout: int = CHECK_TIMEOUT):
+    def __init__(self, check_timeout: int = CHECK_TIMEOUT): # check_timeout is legacy for Luno direct
         """
-        Initializes the DecisionMaker with the given timeout and config settings.
-
-        :param check_timeout: Timeout in seconds for checking order status.
-        :type check_timeout: int
+        Initializes the DecisionMaker.
         """
-        self.check_timeout = check_timeout
-        self.redis = Storage()
-        self.exchange = self._initialize_exchange()
-        self.offset = {'XBT': 0.005, 'XRP': 6.0, 'MYR': 0.0}
+        self.check_timeout = check_timeout 
+        self.redis = Storage() 
+        # self.luno_exchange = self._initialize_luno_exchange() # Removed direct Luno client
+        self.offset = {'XBT': 0.005, 'XRP': 6.0, 'MYR': 0.0} # Legacy offset logic, might need review
+        
+        self.luno_pairs = ["XBT/ZAR", "ETH/ZAR", "BTC/ZAR"] # Configurable list of Luno pairs
 
-    def _initialize_exchange(self) -> ccxt.luno:
-        """Initializes the Luno exchange client with API keys from the config file.
+        self.pending_orders = {} # Generalized: client_order_id -> {exchange, command, status, submission_time, exchange_order_id}
+        
+        self.order_event_stream_ids = {
+            BINANCE_ORDER_RESPONSE_EVENT_STREAM: '$',
+            BINANCE_ORDER_STATUS_UPDATE_EVENT_STREAM: '$',
+            LUNO_ORDER_RESPONSE_EVENT_STREAM: '$',
+            LUNO_ORDER_STATUS_UPDATE_EVENT_STREAM: '$'
+        }
+        self.order_event_consumer_task = asyncio.create_task(self.consume_order_events())
+        logger.info("DecisionMaker initialized. Generic order event consumer started for Binance and Luno.")
 
-        :return: Initialized Luno exchange client.
-        :rtype: ccxt.luno
-        """
-        config = configparser.ConfigParser()
-        config.read("config.cfg")
-        luno_key = config.get('LUNO', 'LUNO_KEY')
-        luno_secret = config.get('LUNO', 'LUNO_SECRET')
-        return ccxt.luno({'apiKey': luno_key, 'secret': luno_secret})
+    # Removed: _initialize_luno_exchange method
+
+    async def close_resources(self): 
+        """Closes resources and cancels consumer task."""
+        if self.order_event_consumer_task and not self.order_event_consumer_task.done():
+            self.order_event_consumer_task.cancel()
+            try:
+                await self.order_event_consumer_task
+            except asyncio.CancelledError:
+                logger.info("Order event consumer task cancelled.")
+            except Exception as e:
+                logger.error(f"Error during order event consumer task cancellation: {e}")
+        
+        # Removed: self.luno_exchange.close()
+        logger.info("DecisionMaker resources (consumer task) closed.")
+
 
     async def construct(self) -> dict:
         """Reads and parses data from Redis for trading decisions.
@@ -73,19 +135,51 @@ class DecisionMaker:
         :type price: float
         :raises Exception: If an error occurs while placing the order.
         """
-        orderside = 'buy' if action == 'BID' else 'sell'
-        order_params = {
-            'market': {'type': 'market', 'amount': float(volume * price) * 1.01 if action == 'BID' else volume},
-            'limit': {'type': 'limit', 'amount': float(volume), 'price': price, 'params': {'stop_price': price, 'stop_direction': 'ABOVE' if action == 'BID' else 'BELOW'}}
-        }
+        order_side = 'buy' if action == 'BID' else 'sell'
+        client_order_id = str(uuid.uuid4())
+        command = PlaceOrderCommand(
+            client_order_id=client_order_id,
+            symbol=pair,
+            type=order_type.lower(),
+            side=order_side,
+            quantity=float(volume),
+            price=float(price) if order_type.lower() == 'limit' else None
+        )
 
-        try:
-            order_params = order_params.get(order_type.lower())
-            # order = await self.exchange.create_order(symbol=pair, **order_params)
-            # await self._wait_order_complete(order['id'])
-            logger.info('Successfully placed a %s %s %s order %s for %.2f', order_type, pair, action, order['id'], volume)
-        except Exception as e:
-            logger.error('Error placing %s order: %s', order_type, e)
+        target_stream = None
+        exchange_name_for_metric = None
+
+        if pair.upper() in self.luno_pairs or any(lp_part in pair.upper() for lp_part in ["XBT", "ZAR", "ETH"] if len(pair.upper()) > 3): # Basic Luno pair check
+            target_stream = LUNO_PLACE_ORDER_COMMAND_STREAM
+            exchange_name_for_metric = "luno"
+            logger.info(f"Routing order for {pair} to Luno connector.")
+        elif "USDT" in pair.upper(): # Default to Binance for USDT pairs
+            target_stream = BINANCE_PLACE_ORDER_COMMAND_STREAM
+            exchange_name_for_metric = "binance"
+            logger.info(f"Routing order for {pair} to Binance connector.")
+        else:
+            logger.warning(f"No connector configured to handle order for pair: {pair}.")
+            return
+
+        if target_stream and exchange_name_for_metric:
+            try:
+                self.pending_orders[client_order_id] = {
+                    "exchange": exchange_name_for_metric,
+                    "command": command.model_dump(),
+                    "status": "pending_submission",
+                    "exchange_order_id": None,
+                    "submission_time": time.time()
+                }
+                await self.redis.storage.xadd(target_stream, {"data": command.model_dump_json()})
+                DM_ORDER_COMMANDS_SENT_TOTAL.labels(exchange=exchange_name_for_metric, pair=pair).inc()
+                DM_PENDING_ORDERS_GAUGE.labels(exchange=exchange_name_for_metric).inc()
+                logger.info(f"Published PlaceOrderCommand to {target_stream} for {exchange_name_for_metric}: client_order_id {client_order_id}, {pair}, {order_side}, vol {volume}")
+            except Exception as e:
+                logger.error(f"Error publishing PlaceOrderCommand to {target_stream} (client_order_id {client_order_id}): {e}")
+                if client_order_id in self.pending_orders:
+                    del self.pending_orders[client_order_id]
+        # Removed direct Luno CCXT client logic
+
 
     async def decide(self, input_data: dict) -> None:
         """Makes trading decisions based on the input data.
@@ -115,22 +209,93 @@ class DecisionMaker:
         except Exception as e:
             logger.error('Error in decision making: %s', e)
 
-    async def _wait_order_complete(self, order_id: str) -> None:
-        """Waits for the order to be completed and logs the status.
+    async def consume_order_events(self): # Renamed from consume_binance_order_events
+        logger.info("Starting generic order event consumer loop for Binance and Luno...")
+        # Uses self.order_event_stream_ids which includes streams for both exchanges
+        
+        while True:
+            try:
+                messages = await self.redis.storage.xread(
+                    streams=self.order_event_stream_ids, # Now includes Luno streams
+                    count=10,
+                    block=1000 
+                )
+                if not messages:
+                    continue
 
-        :param order_id: ID of the order to wait for.
-        :type order_id: str
-        :raises Exception: If an error occurs while fetching the order status.
-        """
-        status = 'open'
-        while status == 'open':
-            await asyncio.sleep(self.check_timeout)
-            order = await self.exchange.fetch_order(order_id)
-            status = order['status']
+                for stream_name_bytes, message_list in messages:
+                    stream_name_str = stream_name_bytes.decode('utf-8')
+                    last_id_processed_for_stream = self.order_event_stream_ids[stream_name_str]
+                    
+                    exchange_name = "unknown"
+                    if BINANCE_CONNECTOR_NAME in stream_name_str:
+                        exchange_name = "binance"
+                    elif LUNO_CONNECTOR_NAME in stream_name_str:
+                        exchange_name = "luno"
 
-        logger.info('Finished order %s with %s status', order_id, status)
-        if status == 'canceled':
-            logger.info('Trade has been canceled')
+                    for message_id_bytes, message_data_dict in message_list:
+                        message_id_str = message_id_bytes.decode('utf-8')
+                        try:
+                            data_json = message_data_dict[b'data'].decode('utf-8')
+                            
+                            if "order_response" in stream_name_str:
+                                event = OrderResponseEvent.model_validate_json(data_json)
+                                DM_ORDER_EVENTS_RECEIVED_TOTAL.labels(exchange=exchange_name, event_type='order_response', pair=event.symbol).inc()
+                                logger.info(f"Received OrderResponseEvent from {exchange_name}: client_order_id {event.client_order_id}, status {event.status}, order_id {event.order_id}")
+                                if event.client_order_id in self.pending_orders:
+                                    self.pending_orders[event.client_order_id]['status'] = event.status
+                                    self.pending_orders[event.client_order_id]['exchange_order_id'] = event.order_id
+                                    if event.error_message:
+                                         self.pending_orders[event.client_order_id]['error'] = event.error_message
+                                    if event.status.lower() in ["rejected", "failed_to_place"]:
+                                        submission_time = self.pending_orders[event.client_order_id].get("submission_time")
+                                        if submission_time:
+                                            DM_ORDER_E2E_DURATION_SECONDS.labels(exchange=exchange_name, pair=event.symbol).observe(time.time() - submission_time)
+                                        DM_PENDING_ORDERS_GAUGE.labels(exchange=exchange_name).dec()
+                                        logger.info(f"{exchange_name.capitalize()} order (client_id: {event.client_order_id}) reached terminal state via OrderResponseEvent: {event.status}")
+                                else:
+                                    logger.warning(f"Received OrderResponseEvent for unknown client_order_id: {event.client_order_id} from {exchange_name}")
+
+                            elif "order_status" in stream_name_str: # Covers both ...:events:order_status
+                                event = OrderStatusUpdateEvent.model_validate_json(data_json)
+                                DM_ORDER_EVENTS_RECEIVED_TOTAL.labels(exchange=exchange_name, event_type='order_status_update', pair=event.symbol).inc()
+                                logger.info(f"Received OrderStatusUpdateEvent from {exchange_name}: order_id {event.order_id}, client_order_id {event.client_order_id}, status {event.status}")
+                                
+                                client_id_to_update = event.client_order_id
+                                if not client_id_to_update: 
+                                    for cid, order_details in self.pending_orders.items():
+                                        if order_details.get('exchange_order_id') == event.order_id and order_details.get('exchange') == exchange_name:
+                                            client_id_to_update = cid
+                                            break
+                                
+                                if client_id_to_update and client_id_to_update in self.pending_orders:
+                                    pending_order_info = self.pending_orders[client_id_to_update]
+                                    pending_order_info['status'] = event.status
+                                    pending_order_info['filled_quantity'] = event.filled_quantity
+                                    
+                                    if event.status.lower() in ["filled", "canceled", "rejected", "expired", "failed"]: 
+                                        submission_time = pending_order_info.get("submission_time")
+                                        if submission_time:
+                                            DM_ORDER_E2E_DURATION_SECONDS.labels(exchange=exchange_name, pair=event.symbol).observe(time.time() - submission_time)
+                                        DM_PENDING_ORDERS_GAUGE.labels(exchange=exchange_name).dec()
+                                        logger.info(f"{exchange_name.capitalize()} order (client_id: {client_id_to_update}, ex_id: {event.order_id}) reached terminal state: {event.status}. Details: {pending_order_info}")
+                                else:
+                                     logger.warning(f"Received OrderStatusUpdateEvent for unknown order from {exchange_name}: order_id {event.order_id}, client_order_id {event.client_order_id}")
+                            
+                            last_id_processed_for_stream = message_id_str
+                        except json.JSONDecodeError as e:
+                            logger.error(f"JSON decode error for message ID {message_id_str} in stream {stream_name_str}: {e}")
+                        except Exception as e: 
+                            logger.error(f"Error processing message ID {message_id_str} from stream {stream_name_str}: {e}")
+                    
+                    self.order_event_stream_ids[stream_name_str] = last_id_processed_for_stream
+            
+            except Exception as e: 
+                logger.error(f"Error in consume_order_events loop: {e}")
+                await asyncio.sleep(5) 
+
+    # Removed: _wait_luno_order_complete method
+    # Removed: _wait_binance_order_complete method
 
     async def main(self) -> None:
         """Main method to handle the trading process.

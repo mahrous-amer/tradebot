@@ -5,6 +5,7 @@ import logging.config
 import yaml
 import argparse
 from aiohttp import web
+from prometheus_client import REGISTRY, generate_latest # Added for Prometheus
 
 from event_loop import EventLoop
 
@@ -16,9 +17,14 @@ health_runner = None
 async def health_check_handler(request):
     return web.json_response({"status": "healthy"}, status=200)
 
+async def metrics_handler(request): # Added for Prometheus
+    data = generate_latest(REGISTRY)
+    return web.Response(body=data, content_type='text/plain; version=0.0.4')
+
 async def start_health_check_server(port=5000): # Port 5000 as in docker-compose
     app = web.Application()
     app.router.add_get("/health", health_check_handler)
+    app.router.add_get("/metrics", metrics_handler) # Added for Prometheus
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', port)

@@ -40,6 +40,74 @@ services:
       timeout: 10s
       retries: 3
 
+  binance-connector:
+    build:
+      context: ./connectors/binance_connector
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8001" # Expose port 8001 for the API
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      # - BINANCE_API_KEY=${BINANCE_API_KEY}       # To be sourced from .env file or CI/CD variables
+      # - BINANCE_API_SECRET=${BINANCE_API_SECRET} # To be sourced from .env file or CI/CD variables
+    networks:
+      - bot-network
+    depends_on:
+      - redis
+    # healthcheck: # Optional: implement a proper healthcheck later
+    #   test: ["CMD-SHELL", "curl -f http://localhost:8001/health || exit 1"]
+    #   interval: 30s
+    #   timeout: 10s
+    #   retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.3"
+          memory: "256M"
+        reservations:
+          cpus: "0.15"
+          memory: "128M"
+      restart_policy:
+        condition: on-failure
+
+  luno-connector:
+    build:
+      context: ./connectors/luno_connector
+      dockerfile: Dockerfile
+    ports:
+      - "8002:8002" # Expose port 8002 for Luno connector
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - LUNO_API_KEY_ID=${LUNO_API_KEY_ID}       # To be sourced from .env file
+      - LUNO_API_SECRET_KEY=${LUNO_API_SECRET_KEY} # To be sourced from .env file
+      # Add any other Luno specific env vars if needed
+    networks:
+      - bot-network
+    depends_on:
+      - redis
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.3"
+          memory: "256M"
+        reservations:
+          cpus: "0.15"
+          memory: "128M"
+      restart_policy:
+        condition: on-failure
+
   # Trading bot service
   bot:
     build: ./bot
