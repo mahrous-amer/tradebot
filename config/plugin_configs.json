@@ -1,0 +1,54 @@
+[
+    {
+        "module": "RSI",
+        "class": "RSIPlugin",
+        "enabled": true,
+        "config": {
+            "exchange_id": "binance",
+            "symbol": "BTC/USDT",
+            "period": 14,
+            "overbought": 70,
+            "oversold": 30
+        }
+    },
+    {
+        "module": "RSI",
+        "class": "RSIPlugin",
+        "enabled": true,
+        "config": {
+            "exchange_id": "luno",
+            "symbol": "XBT/ZAR",
+            "period": 14
+        }
+    },
+    {
+        "module": "SMA",
+        "class": "SMAPlugin",
+        "enabled": true,
+        "config": {
+            "exchange_id": "binance",
+            "symbol": "BTC/USDT",
+            "period": 20
+        }
+    },
+    {
+        "module": "SMA",
+        "class": "SMAPlugin",
+        "enabled": true,
+        "config": {
+            "exchange_id": "binance",
+            "symbol": "BTC/USDT",
+            "period": 50
+        }
+    },
+    {
+        "module": "SMA",
+        "class": "SMAPlugin",
+        "enabled": false,
+        "config": {
+            "exchange_id": "luno",
+            "symbol": "ETH/ZAR",
+            "period": 30
+        }
+    }
+]

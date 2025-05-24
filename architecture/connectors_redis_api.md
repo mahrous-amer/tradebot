@@ -116,6 +116,18 @@ class AccountBalanceEvent(BaseModel):
     total: float 
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc)) # Standardized to UTC
 
+
+# --- Indicator Value Model (Published by Plugins) ---
+# Defined in common_models.indicator_models.py
+
+class IndicatorValue(BaseModel):
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    value: float
+    indicator_name: str  # e.g., "rsi_14", "sma_50", "ema_20"
+    symbol: str          # e.g., "BTC/USDT" (standard format with slash)
+    exchange: str        # e.g., "binance", "luno"
+    # timeframe: Optional[str] = None # e.g., "1h", "4h", "1d" (if needed)
+
 ```
 
 **Note on Pydantic Model Usage for Multiple Exchanges:**
@@ -160,6 +172,18 @@ The Pydantic models defined (e.g., `Ticker`, `PlaceOrderCommand`, `AccountBalanc
     -   `luno_connector:events:order_response`
     -   `luno_connector:events:order_status`
     -   `luno_connector:events:account_balance`
+
+#### 3.4 Indicator Event Streams (Plugin -> Bot/DecisionMaker)
+-   **Pattern:** `indicators:<indicator_full_name>:<exchange_name>:<pair_symbol_concatenated>`
+    -   `<indicator_full_name>`: e.g., `rsi_14` (indicator name + main parameter), `sma_50`, `ema_20_close` (if based on close prices).
+    -   `<exchange_name>`: e.g., `binance`, `luno`.
+    -   `<pair_symbol_concatenated>`: e.g., `BTCUSDT`, `XBTZAR` (uppercase, no separators).
+-   **Examples:**
+    -   `indicators:rsi_14:binance:BTCUSDT`
+    -   `indicators:sma_50:luno:XBTZAR`
+-   **Message Model:**
+    -   The `data` field of messages on these streams will contain a JSON-serialized `IndicatorValue` Pydantic model (defined in `common_models.indicator_models`).
+
 
 ## 4. Message Content on Streams
 -   Each message on a Redis Stream will be a single entry.

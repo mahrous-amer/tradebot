@@ -2,8 +2,9 @@ import inspect
 import os
 import importlib.util
 import asyncio
-import aiofiles
+# import aiofiles # Not used in this refactoring
 import logging
+import json # Added for loading JSON config
 from plugin import Plugin
 from data_provider import DataProvider
 from observer import Observable
@@ -11,105 +12,178 @@ from observer import Observable
 logger = logging.getLogger(__name__)
 
 class PluginHandler(Observable):
-    """Container for managing plugins in a dedicated folder."""
+    """Container for managing plugins based on a configuration file."""
 
-    def __init__(self, plugin_folder: str, data_sink: DataProvider):
-        """Initialize PluginHandler by locating and loading plugins.
+    def __init__(self, plugin_folder: str, data_sink: DataProvider, plugin_config_file: str = "config/plugin_configs.json"): # Modified
+        """Initialize PluginHandler by loading plugins from a configuration file.
 
-        :param plugin_folder: Path to the plugin folder.
+        :param plugin_folder: Base path to the plugin modules (e.g., "bot/plugins").
         :param data_sink: Data provider to be used by plugins.
-        :type plugin_folder: str
-        :type data_sink: DataProvider
+        :param plugin_config_file: Path to the JSON file configuring plugin instances.
         """
-        self.plugin_folder = plugin_folder
+        super().__init__() # Initialize Observable
+        self.plugin_folder_base = plugin_folder # e.g., "bot/plugins"
+        # Assuming technical_indicators are in a subfolder, adjust if structure is different
+        # Example: plugin_folder could be "bot/plugins/technical_indicators" if JSON `module` is just "RSI"
+        # For this implementation, we assume module in JSON means filename, and they are in a known subpath.
+        # A common structure is plugins/technical_indicators/RSI.py
+        # So, if plugin_folder = "plugins", module "RSI" could be in "plugins/technical_indicators/RSI.py"
+        # The loading logic will need to derive the full path.
+        # For simplicity, let's assume plugin_folder = "bot/plugins" and JSON module is like "technical_indicators.RSI"
+        # Or, if plugin_folder = "bot/plugins/technical_indicators", JSON module can be just "RSI"
+
         self.data_sink = data_sink
-        self.plugins = []
-        self.enabled_plugins = []
-        self.completed_task = {}
+        self.plugin_config_file = plugin_config_file
+        self.plugins = [] # Stores all instantiated plugin objects
+        self.enabled_plugins = [] # Stores only enabled plugin objects
+        self.completed_task = {} # For tracking plugin tasks
+        
+        self.plugin_configurations = self._load_plugin_configurations()
+        if self.plugin_configurations:
+            self._register_configured_plugins()
+        else:
+            logger.warning("No plugin configurations loaded. No plugins will be active.")
 
-    async def update(self) -> None:
-        """Detect plugins in the plugin folder and handle changes asynchronously."""
-        self.tmp_found_plugins = []
-        await self.traverse_plugins(self.plugin_folder)
-
-        # unload obsolete plugins
-        await self.unload_obsolete_plugins()
-
-        del self.tmp_found_plugins
-
-    async def traverse_plugins(self, plugin_folder: str) -> None:
-        """Asynchronously traverse the plugin folder to load .py files as plugins.
-
-        :param plugin_folder: Folder containing plugin .py files (and subfolders).
-        :type plugin_folder: str
-        """
-        logger.debug(f'Traversing plugin folder: {plugin_folder}')
-
-        for root, dirs, files in os.walk(plugin_folder):
-            for file in files:
-                if file.endswith(".py") and not file.startswith("__"):
-                    plugin_path = os.path.join(root, file)
-                    module_name = file[:-3]  # strip .py extension
-                    await self.load_plugin(plugin_path, module_name)
-
-    async def load_plugin(self, file_path: str, module_name: str) -> None:
-        """Dynamically load a plugin from a .py file asynchronously.
-
-        :param file_path: Path to the .py plugin file.
-        :param module_name: Name of the module to load.
-        :type file_path: str
-        :type module_name: str
-        """
+    def _load_plugin_configurations(self) -> list:
+        """Loads plugin configurations from the JSON file."""
         try:
-            # Use asyncio.to_thread to handle blocking importlib operations asynchronously
-            module = await asyncio.to_thread(self.load_module, file_path, module_name)
-            if not module:
-                return
-
-            loaded_plugins = {plugin.name for plugin in self.plugins}
-
-            for _, cls in inspect.getmembers(module, inspect.isclass):
-                if issubclass(cls, Plugin) and cls is not Plugin:
-                    plugin_obj = cls(self.data_sink)
-                    if plugin_obj.name not in loaded_plugins:
-                        self.register_plugin(plugin_obj)
+            with open(self.plugin_config_file, 'r') as f:
+                configs = json.load(f)
+            logger.info(f"Successfully loaded {len(configs)} plugin configurations from {self.plugin_config_file}")
+            return configs
+        except FileNotFoundError:
+            logger.error(f"Plugin configuration file not found: {self.plugin_config_file}")
+        except json.JSONDecodeError as e:
+            logger.error(f"Error decoding JSON from {self.plugin_config_file}: {e}")
         except Exception as e:
-            logger.error(f'Failed to load plugin {module_name} from {file_path}: {e}')
+            logger.error(f"An unexpected error occurred while loading plugin configurations: {e}")
+        return []
 
-    def load_module(self, file_path: str, module_name: str):
-        """Helper method to load a module using importlib."""
-        spec = importlib.util.spec_from_file_location(module_name, file_path)
-        if spec is None:
-            logger.error(f"Could not load spec for {module_name} at {file_path}")
-            return None
+    def _register_configured_plugins(self):
+        """Instantiates and registers plugins based on loaded configurations."""
+        loaded_plugin_names = set() # To track names of successfully loaded and instantiated plugins
 
-        module = importlib.util.module_from_spec(spec)
-        # This is blocking, handled by asyncio.to_thread()
-        spec.loader.exec_module(module)
-        return module
+        for conf in self.plugin_configurations:
+            if not conf.get("enabled", False):
+                logger.info(f"Skipping disabled plugin configuration for module {conf.get('module')}, class {conf.get('class')}")
+                continue
 
-    def register_plugin(self, plugin_obj: Plugin) -> None:
-        """Register a new plugin, ensuring uniqueness."""
-        logger.info(f'Loaded plugin class: {plugin_obj.__module__}.{plugin_obj.__class__.__name__}')
+            module_name = conf.get("module")
+            class_name = conf.get("class")
+            config_params = conf.get("config", {})
+
+            if not module_name or not class_name:
+                logger.error(f"Invalid configuration entry: 'module' and 'class' are required. Entry: {conf}")
+                continue
+            
+            try:
+                # Construct module path. Assuming plugins are in subdirectories like 'technical_indicators'
+                # under the self.plugin_folder_base.
+                # Example: plugin_folder_base = "bot/plugins", module_name = "RSI" -> module_path = "bot.plugins.technical_indicators.RSI"
+                # This assumes a structure like: bot/plugins/technical_indicators/RSI.py
+                # The import path should be relative to the project root or PYTHONPATH.
+                # If self.plugin_folder_base is "bot/plugins", and module "RSI" is in "bot/plugins/technical_indicators/RSI.py"
+                # then the import name is "bot.plugins.technical_indicators.RSI"
+                
+                # Let's adjust the assumption: self.plugin_folder_base is "bot/plugins"
+                # and the config "module" refers to the file name (e.g., "RSI", "SMA")
+                # and these files are located in a known sub-package e.g. "technical_indicators"
+                # Thus, the full module path would be e.g. "bot.plugins.technical_indicators.RSI"
+                
+                # Corrected module import logic:
+                # Assuming self.plugin_folder_base = "bot/plugins"
+                # And the actual plugin files are in "bot/plugins/technical_indicators/"
+                # The module name in config ("RSI", "SMA") refers to the file.
+                # The import path needs to be something like: bot.plugins.technical_indicators.RSI
+                
+                # Simplified: Assume module_name in config is the full path relative to project root if plugin_folder is not used directly for this.
+                # Or, construct it. Let's assume plugin_folder is "bot/plugins/technical_indicators"
+                # and module_name in JSON is "RSI"
+                
+                # Path for importlib.util.spec_from_file_location
+                # Example: self.plugin_folder_base = "bot/plugins"
+                # config module = "technical_indicators.RSI"
+                # file_path = "bot/plugins/technical_indicators/RSI.py"
+                # module_import_name = "bot.plugins.technical_indicators.RSI" (for inspection)
+                
+                # Let's assume plugin_folder = "bot/plugins" (passed to __init__)
+                # And module in config is "technical_indicators.RSI" or just "RSI" if a default subfolder is assumed.
+                # For this implementation, assume `module` in JSON is the direct filename "RSI", "SMA"
+                # and they reside in a known subfolder, e.g., "technical_indicators" under `plugin_folder_base`.
+                
+                # This part is tricky and depends heavily on project structure and how `plugin_folder` is defined.
+                # Let's assume `plugin_folder` is `bot/plugins/technical_indicators` for now.
+                # So, if module_name is "RSI", file_path is `bot/plugins/technical_indicators/RSI.py`
+                
+                file_path = os.path.join(self.plugin_folder_base, f"{module_name}.py")
+                # The module_name for importlib should be unique, often reflecting its path.
+                # For spec_from_file_location, the 'name' argument can be arbitrary but good if it's the expected import name.
+                # Let's use a unique name for loading, then get the class by its name.
+                loader_module_name = f"plugin_loader_{module_name.lower()}" 
+                
+                spec = importlib.util.spec_from_file_location(loader_module_name, file_path)
+                if spec is None:
+                    logger.error(f"Could not create spec for module {module_name} at {file_path}")
+                    continue
+                
+                module_obj = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module_obj) # This executes the module's code
+
+                plugin_class = getattr(module_obj, class_name, None)
+
+                if plugin_class and issubclass(plugin_class, Plugin):
+                    plugin_instance = plugin_class(data_sink=self.data_sink, **config_params)
+                    
+                    # Check for duplicate plugin names (generated by plugin's __init__)
+                    if plugin_instance.name in loaded_plugin_names:
+                        logger.warning(f"Plugin with name '{plugin_instance.name}' already loaded. Skipping duplicate configuration for {module_name}.{class_name}.")
+                        continue
+
+                    self.register_plugin(plugin_instance) # Uses the old register_plugin logic
+                    loaded_plugin_names.add(plugin_instance.name)
+                else:
+                    logger.error(f"Class '{class_name}' not found or not a subclass of Plugin in module '{module_name}'.")
+
+            except FileNotFoundError:
+                logger.error(f"Plugin file for module '{module_name}' not found at expected path: {file_path}")
+            except AttributeError:
+                 logger.error(f"Class '{class_name}' not found in module '{module_name}' at {file_path}.")
+            except TypeError as te:
+                logger.error(f"Error instantiating plugin {class_name} from module {module_name}. Check config params. Error: {te}")
+            except Exception as e:
+                logger.error(f"Failed to load or instantiate plugin from config {conf}: {e}", exc_info=True)
+
+
+    async def update(self) -> None: # Modified
+        """
+        The primary mechanism for loading plugins is now config-driven at __init__.
+        This method could be used for dynamic reloading of config in future, but not implemented.
+        For now, it ensures that the internal state of enabled plugins matches what was loaded.
+        """
+        # The `self.plugins` and `self.enabled_plugins` are populated by _register_configured_plugins
+        # No file system traversal or dynamic unloading/reloading based on file changes is done here anymore.
+        # If dynamic updates are needed, this method would re-trigger config loading and diffing.
+        logger.info("PluginHandler.update() called. Plugin loading is now config-driven at initialization.")
+        # Ensure tmp_found_plugins is consistent if unload_obsolete_plugins were to be used (it's removed for now)
+        # self.tmp_found_plugins = [p.name for p in self.plugins] 
+
+
+    # Removed: traverse_plugins, load_plugin, load_module, unload_obsolete_plugins
+    # These are replaced by the config-driven loading in __init__ and helper methods.
+
+    def register_plugin(self, plugin_obj: Plugin) -> None: # Kept, but called by _register_configured_plugins
+        """Register a new plugin instance."""
+        logger.info(f"Registering plugin instance: {plugin_obj.name} (Class: {plugin_obj.__class__.__name__}, Exchange: {getattr(plugin_obj, 'exchange_id', 'N/A')}, Symbol: {getattr(plugin_obj, 'symbol', 'N/A')})")
         self.plugins.append(plugin_obj)
 
+        # Enable plugin if it's not already (it should be, as we only process enabled configs)
+        # and if its name is unique among currently enabled plugins.
         if plugin_obj.name not in [p.name for p in self.enabled_plugins]:
             self.enable(plugin_obj)
+        else:
+            # This case should ideally be prevented by the check in _register_configured_plugins
+            logger.warning(f"Plugin with name '{plugin_obj.name}' was already enabled. This might indicate duplicate name generation logic in plugins.")
 
-        self.tmp_found_plugins.append(plugin_obj.name)
-
-    async def unload_obsolete_plugins(self) -> None:
-        """Unload plugins that are no longer found in the plugin folder."""
-        loaded_plugins = [plugin.name for plugin in self.plugins]
-        obsolete_plugin_names = set(loaded_plugins) - set(self.tmp_found_plugins)
-        obsolete_plugins = [plugin for plugin in self.plugins if plugin.name in obsolete_plugin_names]
-
-        for plugin in obsolete_plugins:
-            logger.info(f'Unloading plugin class: {plugin.name}.{plugin.__class__.__name__}')
-            self.plugins.remove(plugin)
-            if plugin in self.enabled_plugins:
-                await self.disable(plugin)
-            del plugin
 
     async def invoke_callback(self, *instr, plugin_list=None) -> dict:
         """Invoke a callback function on the specified plugins asynchronously.

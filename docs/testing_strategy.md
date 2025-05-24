@@ -95,6 +95,46 @@ The primary goal of integration testing is to ensure that independently develope
     -   Metrics endpoints return data in Prometheus format.
     -   Expected metrics (e.g., `binc_commands_received_total`, `lc_commands_received_total`, `dm_order_commands_sent_total`) are present.
 
+### 3.5. Testing Implemented Strategies
+
+This section outlines how to test the example trading strategies implemented in `bot/DecisionMaker`.
+
+-   **Prerequisites:**
+    -   Ensure `config/plugin_configs.json` is correctly configured to enable the necessary plugin instances:
+        -   For RSI Strategy: An `RSIPlugin` instance for `binance` and `BTC/USDT` with `period: 14`.
+        -   For MA Crossover Strategy: Two `SMAPlugin` instances for `luno` and `XBT/ZAR`, one with `period: 20` and another with `period: 50`.
+    -   Ensure `bot/DecisionMaker`'s `__init__` method is configured to listen to the specific indicator streams published by these plugins (e.g., `indicators:rsi_14:binance:BTCUSDT`, `indicators:sma_20:luno:XBTZAR`, `indicators:sma_50:luno:XBTZAR`).
+    -   Ensure the respective connectors (`binance-connector`, `luno-connector`) are running and configured (e.g., with API keys for a testnet or paper trading account if live orders are intended).
+    -   Ensure the `bot` service, `redis`, and `postgres` are running.
+
+-   **Test Steps (General Approach):**
+    1.  **Start Services:** Use `docker-compose up --build -d` to start all services.
+    2.  **Simulate Market Data:** Manually or via a script, publish a sequence of `Ticker` messages to the relevant market data streams (e.g., `binance:BTCUSDT:ticker` for the RSI strategy, `luno:XBTZAR:ticker` for the MA Crossover strategy). These messages should simulate price movements that would cause the configured indicators (RSI, SMAs) to cross their defined thresholds or perform crossovers.
+        -   *Example for RSI:* To test RSI going below 30, publish a series of ticker messages with decreasing prices.
+        -   *Example for MA Crossover:* To test a golden cross (SMA20 > SMA50), publish ticker messages that would first establish the SMAs and then cause the short SMA to rise above the long SMA.
+    3.  **Monitor Indicator Streams:** Observe the relevant indicator streams (e.g., `indicators:rsi_14:binance:BTCUSDT`, `indicators:sma_20:luno:XBTZAR`, `indicators:sma_50:luno:XBTZAR`) using a Redis client (e.g., `redis-cli XREAD STREAMS ... BLOCK 0 ...`). Verify that the `RSIPlugin` and `SMAPlugin` instances are correctly calculating and publishing `IndicatorValue` messages in response to the simulated market data. Check the `value`, `indicator_name`, `exchange`, and `symbol` fields.
+    4.  **Monitor `DecisionMaker` Logs:** Observe the logs from the `bot` service. Look for log entries from `DecisionMaker` indicating:
+        -   Reception and caching of indicator values.
+        -   Execution of the specific strategy methods (`_strategy_rsi_binance_btcusdt`, `_strategy_ma_luno_xbtzar`).
+        -   Evaluation of strategy conditions (e.g., "RSI below threshold", "Golden Cross detected").
+        -   Balance checks.
+        -   Checks for existing open orders.
+    5.  **Monitor Command Streams:** If a strategy condition is met and an order should be placed, monitor the appropriate command stream (e.g., `binance_connector:commands:place_order` or `luno_connector:commands:place_order`) for a new `PlaceOrderCommand` message. Verify its content (symbol, side, type, quantity).
+    6.  **Monitor Event Streams:** Observe the corresponding connector event streams (e.g., `binance_connector:events:order_response` and `binance_connector:events:order_status`) for feedback on the order placement and subsequent status updates.
+    7.  **Verify `DecisionMaker` State:** Check `DecisionMaker` logs or (if possible via debugging/tooling) its internal `pending_orders` cache to ensure it correctly tracks the state of sent orders based on received events.
+
+-   **Specific Checks for RSI Strategy (Binance BTC/USDT):**
+    -   Simulate price action causing RSI(14) for BTC/USDT to drop below 30. Verify a market BUY `PlaceOrderCommand` is sent to `binance_connector:commands:place_order` for BTC/USDT (fixed quantity).
+    -   Simulate price action causing RSI(14) to rise above 70. Verify a market SELL `PlaceOrderCommand` is sent.
+    -   Verify the anti-duplicate logic prevents new orders if a relevant order is already pending.
+    -   Verify staleness check for RSI data.
+
+-   **Specific Checks for MA Crossover Strategy (Luno XBT/ZAR):**
+    -   Simulate prices leading to SMA(20) crossing above SMA(50) for XBT/ZAR. Verify a market BUY `PlaceOrderCommand` is sent to `luno_connector:commands:place_order` for XBT/ZAR (fixed quantity). Ensure this only happens once per cross due to the `self.luno_xbtzar_sma_crossed_above` state variable.
+    -   Simulate prices leading to SMA(20) crossing below SMA(50). Verify a market SELL `PlaceOrderCommand` is sent. Ensure this only happens once per cross.
+    -   Verify the anti-duplicate logic.
+    -   Verify staleness check for SMA data.
+
 ## 4. Future Testing Considerations
 
 -   **Automated Integration Tests:** Using a Python testing framework (e.g., `pytest`) to automate the scenarios above. This would involve:
